@@ -61,6 +61,7 @@ import logging
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -160,6 +161,12 @@ def get_pdf_inspector():
     return _pi
 
 
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".webp", ".heic"}
+
+LOCKED_PDF = ("This PDF is locked with a password, so there is no way in to read it. Open "
+              "it with its password, save or print it as a new PDF, and drop that copy instead.")
+
+
 def unique_path(folder: Path, stem: str, ext: str = ".md") -> Path:
     p = folder / f"{stem}{ext}"
     n = 1
@@ -220,6 +227,11 @@ def convert_pdf(path: str, display_name: str = ""):
         # refused (encrypted, corrupt, not a PDF). Neither is worth showing to
         # someone who just dropped a file — markitdown still gets its turn, and
         # gets to raise its own error if it fails too.
+        # The one refusal worth a sentence: a password-locked PDF. markitdown
+        # can't open it either and would only say PDFPasswordIncorrect, so
+        # passing it along would trade a padlock for a stack of jargon.
+        if pdf_is_locked(path):
+            raise UserFacingError(LOCKED_PDF) from None
         # Name the file the user actually dropped, not the temp copy — a silent
         # fallback nobody can trace back to a document is not much of a log line.
         print(f"[documents] pdf-inspector passed on {display_name or Path(path).name} "
@@ -261,6 +273,17 @@ def convert_document(filename: str, data: bytes, out_dir: Path) -> Path:
             with _md_lock:
                 result = md.convert(tmp_path)
             text = result.text_content or ""
+        if not text.strip():
+            # A 0-byte .md looks converted until somebody opens it — the very
+            # thing the PDF scan gate exists to prevent — so no format gets to
+            # write one. A photo is the usual culprit, and it has a tab to go to.
+            if suffix.lower() in IMAGE_SUFFIXES:
+                raise UserFacingError("This is a picture, so there is no text in it to read. "
+                                      "Read it on the Scans & Photos tab instead.")
+            if suffix.lower() == ".pdf":    # only reachable when pdf-inspector sat this one out
+                raise UserFacingError("No text came out of this PDF, so it is most likely a scan. "
+                                      "Read it on the Scans & Photos tab instead.")
+            raise UserFacingError("Nothing readable came out of this file, so no .md was written.")
         out_path = unique_path(out_dir, Path(filename).stem)
         out_path.write_text(text, encoding="utf-8")
         return out_path
@@ -324,12 +347,29 @@ def _open_pdf(path: str):
     return pymupdf.open(path)
 
 
+def pdf_is_locked(path: str) -> bool:
+    """True for a PDF that needs a password just to be read. Every engine here
+    fails on one with a message about parsing, which sends the reader looking
+    for a broken file rather than a padlock. False if PyMuPDF isn't aboard, so
+    the caller's own error still gets its say."""
+    try:
+        doc = _open_pdf(path)
+    except Exception:
+        return False
+    try:
+        return bool(doc.needs_pass)
+    finally:
+        doc.close()
+
+
 def probe_pdf(path: str):
     """(page_count, has_text). A PDF whose pages carry no extractable text is a
     scan — pdf2docx would return a Word file of page images, which is not what
     anyone means by 'convert to Word'."""
     doc = _open_pdf(path)
     try:
+        if doc.needs_pass:
+            raise ValueError(LOCKED_PDF)
         chars = 0
         for i in range(min(10, doc.page_count)):
             chars += len(doc[i].get_text().strip())
@@ -372,8 +412,13 @@ def parse_page_spec(spec: str, total: int):
 
 MD_SUFFIXES = {".md", ".markdown", ".mdown", ".mkd"}
 
-_FRONTMATTER_RE = re.compile(r"\A﻿?---[ \t]*\r?\n.*?\r?\n---[ \t]*\r?\n", re.S)
-_WIKILINK_RE = re.compile(r"(!?)\[\[([^\]|]+?)(?:\|([^\]]*))?\]\]")
+_FRONTMATTER_RE = re.compile(r"\A﻿?---[ \t]*\r?\n(?:.*?\r?\n)?---[ \t]*(?:\r?\n|\Z)", re.S)
+# A code span is matched only so that it can be handed back untouched: the
+# wikilink rewrite must not reach inside code (see obsidian_to_commonmark).
+# Spans may wrap a line but not cross a blank one, as in CommonMark.
+_WIKILINK_RE = re.compile(r"(?<!`)(`+)(?!`)(?:(?!\n[ \t]*\n).)+?(?<!`)\1(?!`)"
+                          r"|(!?)\[\[([^\]|]+?)(?:\|([^\]]*))?\]\]", re.S)
+_BR_RE = re.compile(r"<br\s*/?>", re.I)
 _HIGHLIGHT_RE = re.compile(r"==(.+?)==", re.S)
 _CALLOUT_RE = re.compile(r"^\[!([A-Za-z-]+)\][+-]?[ \t]*(.*)$")
 _TASK_RE = re.compile(r"^\[([ xX])\][ \t]+")
@@ -403,6 +448,8 @@ def _docx_bits():
 
 def decode_text(data: bytes) -> str:
     """Notes are UTF-8 in practice; anything older still has to open."""
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return data.decode("utf-16")      # Notepad's "Unicode"; never valid UTF-8
     for encoding in ("utf-8-sig", "utf-8", "cp1252"):
         try:
             return data.decode(encoding)
@@ -416,19 +463,40 @@ def obsidian_to_commonmark(text: str) -> str:
     frontmatter is note metadata with nowhere to live in Word; a wikilink points
     into a vault Word cannot open, so it keeps only its visible label; an embed
     becomes an image node, which renders as one placeholder line because the
-    browser uploaded the .md file and nothing around it."""
+    browser uploaded the .md file and nothing around it.
+
+    Code is left exactly as written: `if [[ -f x ]]` in a shell snippet is not
+    a wikilink, and collapsing it to `if -f x` would quietly break someone's
+    code. markdown-it itself finds the fenced and indented blocks, so a fence
+    nested in a list or a quote is skipped exactly where the real parse will
+    see it; code spans are skipped by _WIKILINK_RE."""
+    from markdown_it import MarkdownIt
     text = text.replace("\r\n", "\n")
     text = _FRONTMATTER_RE.sub("", text, count=1)
 
     def link(m):
-        bang, target, alias = m.group(1), m.group(2).strip(), m.group(3)
+        if m.group(1):
+            return m.group(0)               # a code span, handed back as-is
+        bang, target, alias = m.group(2), m.group(3).strip(), m.group(4)
         label = (alias or "").strip() or target
         # embed targets are Obsidian filenames and nearly always contain spaces
         # ('Pasted image 20260730.png'), which a bare CommonMark destination
         # cannot hold — the angle-bracket form can
         return f"![{label}](<{target}>)" if bang else label
 
-    return _WIKILINK_RE.sub(link, text)
+    lines = text.split("\n")
+    in_code = [False] * len(lines)
+    for t in MarkdownIt("commonmark").parse(text):
+        if t.type in ("fence", "code_block") and t.map:
+            for n in range(*t.map):
+                in_code[n] = True
+    out, start = [], 0
+    for n in range(1, len(lines) + 1):      # one run of prose or code at a time
+        if n == len(lines) or in_code[n] != in_code[start]:
+            chunk = "\n".join(lines[start:n])
+            out.append(chunk if in_code[start] else _WIKILINK_RE.sub(link, chunk))
+            start = n
+    return "\n".join(out)
 
 
 class _MarkdownDocx:
@@ -438,10 +506,10 @@ class _MarkdownDocx:
     def __init__(self, doc):
         self.doc = doc
         self.D = _docx_bits()
-        self.lists = []          # 'ul' / 'ol', one per open list
+        self.lists = []          # one dict per open list: ol, start, num (see _number)
         self.quotes = 0
         self.link_el = None      # runs go inside this while a link is open
-        self.pending_task = False
+        self.item_start = False  # a list item is open and has no paragraph yet
         self.pending_callout = False
 
     # ---- inline runs
@@ -504,7 +572,8 @@ class _MarkdownDocx:
             if ty == "text":
                 self._text(para, t.content, marks)
             elif ty == "code_inline":
-                self._text(para, t.content, marks + ["code"])
+                # straight to a run: `a == b && c == d` is code, not a highlight
+                self._run(para, t.content, marks + ["code"])
             elif ty in ("strong_open", "em_open", "s_open"):
                 marks.append(ty[:-5])
             elif ty in ("strong_close", "em_close", "s_close"):
@@ -526,18 +595,47 @@ class _MarkdownDocx:
                 label = (t.content or "").strip() or (t.attrGet("src") or "image")
                 self._run(para, f"[image: {label}]", marks + ["dim"])
             elif ty == "html_inline":
-                self._text(para, t.content, marks)
+                if _BR_RE.fullmatch(t.content):
+                    # the only way a Markdown table cell can hold a line break
+                    self._run(para, "", marks).add_break()
+                else:
+                    self._text(para, t.content, marks)
 
     # ---- block shells
 
     def _paragraph(self):
         if self.lists:
             depth = min(len(self.lists), 3)
-            base = "List Number" if self.lists[-1] == "ol" else "List Bullet"
-            return self.doc.add_paragraph(style=base if depth == 1 else f"{base} {depth}")
+            suffix = "" if depth == 1 else f" {depth}"
+            if not self.item_start:
+                # a second paragraph in the same item: indented to match, but
+                # it must not take a number or bullet of its own
+                return self.doc.add_paragraph(style=f"List Continue{suffix}")
+            lst = self.lists[-1]
+            if not lst["ol"]:
+                return self.doc.add_paragraph(style=f"List Bullet{suffix}")
+            para = self.doc.add_paragraph(style=f"List Number{suffix}")
+            self._number(para, lst)
+            return para
         if self.quotes:
             return self.doc.add_paragraph(style="Quote")
         return self.doc.add_paragraph()
+
+    def _number(self, para, lst):
+        """Every 'List Number' paragraph in a document shares its style's one
+        counter, so a second numbered list would carry on from where the first
+        stopped (4, 5, 6…), and a list written as '5.' would not start at 5.
+        Each list gets its own w:num over the style's numbering instead, made
+        on its first item and restarted at the list's own start."""
+        if lst["num"] is None:
+            numbering = self.doc.part.numbering_part.element
+            style_num = para.style.element.pPr.numPr.numId.val
+            num = numbering.add_num(numbering.num_having_numId(style_num).abstractNumId.val)
+            num.add_lvlOverride(ilvl=0).add_startOverride(lst["start"])
+            lst["num"] = num.numId
+        numPr = para._p.get_or_add_pPr().get_or_add_numPr()
+        numPr.get_or_add_ilvl().val = 0
+        numPr.get_or_add_numId().val = lst["num"]
 
     def _shade(self, para):
         D = self.D
@@ -652,8 +750,8 @@ class _MarkdownDocx:
                 children = (tokens[i + 1].children
                             if i + 1 < len(tokens) and tokens[i + 1].type == "inline"
                             else [])
-                if self.pending_task:
-                    self.pending_task = False
+                if self.item_start:
+                    self.item_start = False
                     self._checkbox(para, children)
                 if self.pending_callout:
                     self.pending_callout = False
@@ -663,12 +761,15 @@ class _MarkdownDocx:
                 continue
 
             if ty in ("bullet_list_open", "ordered_list_open"):
-                self.lists.append("ol" if ty.startswith("ordered") else "ul")
+                self.lists.append({"ol": ty.startswith("ordered"),
+                                   "start": int(t.attrGet("start") or 1), "num": None})
             elif ty in ("bullet_list_close", "ordered_list_close"):
                 if self.lists:
                     self.lists.pop()
             elif ty == "list_item_open":
-                self.pending_task = True
+                self.item_start = True
+            elif ty == "list_item_close":
+                self.item_start = False    # an empty item must not reach past itself
             elif ty == "blockquote_open":
                 self.quotes += 1
                 self.pending_callout = True
@@ -838,6 +939,10 @@ def run_word_job(job_id: str, filename: str, data: bytes, out_dir: Path, page_sp
 OCR = {"state": "checking", "detail": "", "log": deque(maxlen=300)}
 _ocr_lock = threading.Lock()
 _worker_proc = None
+# Every child here has its output captured or needs none, so none of them
+# should flash a console window on Windows — the GPU probe and the two
+# interpreter probes run at every launch, and pip runs once per install step.
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 
 def _log(line: str):
@@ -859,7 +964,8 @@ def has_nvidia_gpu() -> bool:
     if not exe:
         return False
     try:
-        return subprocess.run([exe], capture_output=True, timeout=15).returncode == 0
+        return subprocess.run([exe], capture_output=True, timeout=15,
+                              creationflags=_NO_WINDOW).returncode == 0
     except Exception:
         return False
 
@@ -871,7 +977,7 @@ def probe_python(py: Path) -> bool:
     try:
         r = subprocess.run(
             [str(py), "-c", "import torch,sys;sys.exit(0 if torch.cuda.is_available() else 3)"],
-            capture_output=True, timeout=180,
+            capture_output=True, timeout=180, creationflags=_NO_WINDOW,
         )
         return r.returncode == 0
     except Exception:
@@ -912,12 +1018,11 @@ def start_worker(py: Path):
     shutil.copy2(src, run_copy)
     OCR.update(state="starting")
     _log("starting OCR engine…")
-    flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
     _worker_proc = subprocess.Popen(
         [str(py), str(run_copy), "--no-browser", "--port", str(WORKER_PORT),
          "--output-dir", str(DEFAULT_OUTPUT)]   # both tabs share one export folder
         + WORKER_EXTRA_ARGS,
-        creationflags=flags,
+        creationflags=_NO_WINDOW,
     )
     for _ in range(60):
         if worker_alive():
@@ -955,7 +1060,8 @@ def _download(url: str, dest: Path, label: str):
 def _run_logged(args, label: str):
     _log(f"{label}…")
     p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                         text=True, encoding="utf-8", errors="replace")
+                         text=True, encoding="utf-8", errors="replace",
+                         creationflags=_NO_WINDOW)
     for line in p.stdout:
         _log(line)
     if p.wait() != 0:
@@ -1936,7 +2042,7 @@ pollOcr();
         <span class="idx">${i + 1}</span>
         <span class="thumb${f.thumb ? '' : ' loading'}" title="Click to preview all pages">${thumbInner}</span>
         <span class="meta">
-          <div class="name" title="${f.name.replace(/"/g, '&quot;')}">${f.name}</div>
+          <div class="name"></div>
           <div class="info">${pageInfo} · ${fmtSize(f.size)}</div>
         </span>
         <span class="btns">
@@ -1944,6 +2050,8 @@ pollOcr();
           <button class="iconbtn down" ${i === files.length - 1 ? 'disabled' : ''} title="Move down">↓</button>
           <button class="iconbtn del" title="Remove">✕</button>
         </span>`;
+      li.querySelector('.name').textContent = f.name;   // textContent, as on the other
+      li.querySelector('.name').title = f.name;         // tabs: a filename may contain markup
 
       li.querySelector('.up').onclick = () => move(i, i - 1);
       li.querySelector('.down').onclick = () => move(i, i + 1);
@@ -1996,31 +2104,42 @@ pollOcr();
     render();
   }
 
+  // Bumped by every open and close. A render loop that sees it move has been
+  // superseded and stops: checking only whether the modal is hidden misses
+  // "closed one file, opened the next", and the first file's remaining pages
+  // would carry on landing under the second file's title.
+  let previewing = 0;
+
   async function openPreview(f) {
+    const mine = ++previewing;
     modalTitle.textContent = f.name;
     pagesEl.innerHTML = '<div style="color:var(--muted)">Rendering pages…</div>';
     modal.classList.remove('hidden');
+    let pdf = null;
     try {
-      const pdf = await pdfjsLib.getDocument({ data: f.bytes.slice(0) }).promise;
+      pdf = await pdfjsLib.getDocument({ data: f.bytes.slice(0) }).promise;
+      if (mine !== previewing) return;
       pagesEl.innerHTML = '';
       const scale = Math.min(1.5, Math.max(0.8, (Math.min(800, window.innerWidth - 60)) / 612));
-      for (let n = 1; n <= pdf.numPages; n++) {
-        if (modal.classList.contains('hidden')) break; // user closed mid-render
+      for (let n = 1; n <= pdf.numPages && mine === previewing; n++) {
         const page = await pdf.getPage(n);
         const viewport = page.getViewport({ scale });
         const canvas = document.createElement('canvas');
         canvas.width = Math.ceil(viewport.width);
         canvas.height = Math.ceil(viewport.height);
         await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
-        pagesEl.appendChild(canvas);
+        if (mine === previewing) pagesEl.appendChild(canvas);
       }
-      await pdf.destroy();
     } catch (e) {
-      pagesEl.innerHTML = '<div style="color:var(--danger)">Could not render this PDF (it may be encrypted).</div>';
+      if (mine === previewing)
+        pagesEl.innerHTML = '<div style="color:var(--danger)">Could not render this PDF (it may be encrypted).</div>';
+    } finally {
+      if (pdf) await pdf.destroy();
     }
   }
 
   function closePreview() {
+    previewing++;
     modal.classList.add('hidden');
     pagesEl.innerHTML = '';
   }
@@ -2078,6 +2197,10 @@ pollOcr();
   const splitStatus = document.getElementById('splitStatus');
 
   let splitDoc = null; // { name, bytes, pages, selected:Set<number> }
+  // Bumped by every load and by Clear. Thumbnails trail in one page at a time,
+  // so a slow file (a scan, say) is still rendering when the next one is
+  // dropped — and without this its later pages land on the new file's grid.
+  let splitLoad = 0;
 
   function setSplitStatus(msg, cls = '') {
     splitStatus.textContent = msg;
@@ -2091,27 +2214,32 @@ pollOcr();
       setSplitStatus('Please choose a PDF file.', 'err');
       return;
     }
+    const load = ++splitLoad;
     setSplitStatus('Loading…');
     if (!await ready(setSplitStatus)) return;
+    let pdf = null;
     try {
       const bytes = new Uint8Array(await file.arrayBuffer());
-      const pdf = await pdfjsLib.getDocument({ data: bytes.slice(0) }).promise;
+      pdf = await pdfjsLib.getDocument({ data: bytes.slice(0) }).promise;
+      if (load !== splitLoad) return;
       splitDoc = { name: file.name, bytes, pages: pdf.numPages, selected: new Set() };
       for (let i = 1; i <= pdf.numPages; i++) splitDoc.selected.add(i); // select all by default
       renderSplit();
       setSplitStatus('');
-      // fill in thumbnails progressively
-      for (let n = 1; n <= pdf.numPages; n++) {
+      // fill in thumbnails progressively, for as long as this file owns the grid
+      for (let n = 1; n <= pdf.numPages && load === splitLoad; n++) {
         const url = await renderPageToDataURL(pdf, n, 0.5);
-        const img = splitGrid.querySelector('[data-page="' + n + '"] img');
+        const img = load === splitLoad && splitGrid.querySelector('[data-page="' + n + '"] img');
         if (img) img.src = url;
       }
-      await pdf.destroy();
     } catch (e) {
+      if (load !== splitLoad) return;
       console.error(e);
       setSplitStatus('Could not read this PDF (it may be encrypted).', 'err');
       splitDoc = null;
       renderSplit();
+    } finally {
+      if (pdf) await pdf.destroy();
     }
   }
 
@@ -2202,14 +2330,17 @@ pollOcr();
     if (!splitDoc || splitDoc.selected.size === 0) return;
     extractBtn.disabled = true;
     setSplitStatus('Extracting…');
+    // read everything now: a file dropped mid-extract replaces splitDoc, and
+    // the output must not take the new file's name or page list
+    const bytes = splitDoc.bytes;
+    const name = splitBaseName() + ' (pages ' + selectionToRangeStr() + ').pdf';
+    const idx = [...splitDoc.selected].sort((a, b) => a - b).map(n => n - 1);
     try {
-      const src = await PDFLib.PDFDocument.load(splitDoc.bytes, { ignoreEncryption: true });
+      const src = await PDFLib.PDFDocument.load(bytes, { ignoreEncryption: true });
       const out = await PDFLib.PDFDocument.create();
-      const idx = [...splitDoc.selected].sort((a, b) => a - b).map(n => n - 1);
       const copied = await out.copyPages(src, idx);
       copied.forEach(p => out.addPage(p));
-      const path = await saveToFolder(await out.save(),
-        splitBaseName() + ' (pages ' + selectionToRangeStr() + ').pdf');
+      const path = await saveToFolder(await out.save(), name);
       setSplitStatus('Extracted ' + idx.length + ' page(s) → ' + baseName(path), 'ok');
     } catch (e) {
       console.error(e);
@@ -2230,14 +2361,15 @@ pollOcr();
     }
     splitAllBtn.disabled = true;
     setSplitStatus('Splitting…');
+    const bytes = splitDoc.bytes, base = splitBaseName();   // see extractSelected
     try {
-      const src = await PDFLib.PDFDocument.load(splitDoc.bytes, { ignoreEncryption: true });
+      const src = await PDFLib.PDFDocument.load(bytes, { ignoreEncryption: true });
       for (const n of pages) {
         setSplitStatus('Splitting page ' + n + '…');
         const out = await PDFLib.PDFDocument.create();
         const [pg] = await out.copyPages(src, [n - 1]);
         out.addPage(pg);
-        await saveToFolder(await out.save(), splitBaseName() + ' - p' + n + '.pdf');
+        await saveToFolder(await out.save(), base + ' - p' + n + '.pdf');
       }
       setSplitStatus('Saved ' + pages.length + ' file(s) to the output folder.', 'ok');
     } catch (e) {
@@ -2277,7 +2409,7 @@ pollOcr();
   });
   extractBtn.addEventListener('click', extractSelected);
   splitAllBtn.addEventListener('click', splitEachPage);
-  splitClearBtn.addEventListener('click', () => { splitDoc = null; renderSplit(); setSplitStatus(''); });
+  splitClearBtn.addEventListener('click', () => { splitLoad++; splitDoc = null; renderSplit(); setSplitStatus(''); });
 
   /* ===================== Compress ===================== */
   const compressDrop = document.getElementById('compressDrop');
@@ -2303,6 +2435,10 @@ pollOcr();
   let compressLevel = 'balanced';
   let compressDoc = null;     // { name, bytes, pages }
   let compressedBytes = null;
+  // Bumped by each run, a new file, a new level and Clear. A run that sees it
+  // move throws its result away: otherwise a file dropped mid-compress would be
+  // offered — and saved under its own name — with the previous file's pages.
+  let compressRun = 0;
 
   function setCompressStatus(msg, cls = '') {
     compressStatus.textContent = msg;
@@ -2320,6 +2456,7 @@ pollOcr();
       setCompressStatus('Please choose a PDF file.', 'err');
       return;
     }
+    compressRun++;
     setCompressStatus('Loading…');
     resetCompressOutput();
     if (!await ready(setCompressStatus)) return;
@@ -2352,14 +2489,18 @@ pollOcr();
 
   async function runCompress() {
     if (!compressDoc) return;
+    const run = ++compressRun;
+    const doc = compressDoc;
     const { dpi, quality } = LEVELS[compressLevel];
     compressBtn.disabled = true;
     resetCompressOutput();
+    let pdf = null;
     try {
-      const pdf = await pdfjsLib.getDocument({ data: compressDoc.bytes.slice(0) }).promise;
+      pdf = await pdfjsLib.getDocument({ data: doc.bytes.slice(0) }).promise;
       const out = await PDFLib.PDFDocument.create();
       const scale = dpi / 72;
       for (let n = 1; n <= pdf.numPages; n++) {
+        if (run !== compressRun) return;
         setCompressStatus('Compressing page ' + n + ' / ' + pdf.numPages + '…');
         const page = await pdf.getPage(n);
         const base = page.getViewport({ scale: 1 });   // page size in points (1pt = 1/72")
@@ -2377,9 +2518,10 @@ pollOcr();
         p.drawImage(img, { x: 0, y: 0, width: base.width, height: base.height });
         canvas.width = canvas.height = 0; // release memory
       }
-      await pdf.destroy();
-      compressedBytes = await out.save();
-      const orig = compressDoc.bytes.length;
+      const saved = await out.save();
+      if (run !== compressRun) return;
+      compressedBytes = saved;
+      const orig = doc.bytes.length;
       const now = compressedBytes.length;
       const pct = Math.round((1 - now / orig) * 100);
       compressResult.classList.remove('hidden');
@@ -2395,10 +2537,12 @@ pollOcr();
       }
       compressSaveBtn.classList.remove('hidden');
     } catch (e) {
+      if (run !== compressRun) return;
       console.error(e);
       setCompressStatus('Compression failed: ' + e.message, 'err');
     } finally {
-      compressBtn.disabled = !compressDoc;
+      if (pdf) await pdf.destroy();
+      if (run === compressRun) compressBtn.disabled = !compressDoc;
     }
   }
 
@@ -2422,7 +2566,9 @@ pollOcr();
     if (!btn) return;
     compressLevel = btn.dataset.level;
     levelBtns.querySelectorAll('.level').forEach(b => b.classList.toggle('active', b === btn));
-    resetCompressOutput();      // a new level invalidates the previous result
+    compressRun++;              // a new level invalidates the previous result,
+    resetCompressOutput();      // and any run still going at the old one
+    compressBtn.disabled = !compressDoc;
     setCompressStatus('');
   });
   compressBtn.addEventListener('click', runCompress);
@@ -2439,6 +2585,7 @@ pollOcr();
     }
   });
   compressClearBtn.addEventListener('click', () => {
+    compressRun++;
     compressDoc = null;
     resetCompressOutput();
     compressPanel.classList.add('hidden');
@@ -2452,9 +2599,44 @@ pollOcr();
 """
 
 
+class Server(ThreadingHTTPServer):
+    """HTTPServer turns on SO_REUSEADDR, and on Windows that flag means 'share a
+    port somebody is already listening on' rather than 'rebind past TIME_WAIT'.
+    A second copy of the app would bind 8770 right alongside the first, the two
+    would split the page's requests between them — a Word conversion started
+    in one and polled in the other is 'no longer being tracked' — and the
+    double-launch scan in main() would never move on to 8771. Windows has the
+    opposite flag for exactly this; everywhere else nothing changes."""
+    allow_reuse_address = not hasattr(socket, "SO_EXCLUSIVEADDRUSE")
+
+    def server_bind(self):
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
+
+    def _trusted(self) -> bool:
+        """Listening on 127.0.0.1 keeps other computers out, but not other web
+        pages: any site open in the same browser can send this server a request.
+        A plain-text POST is a 'simple' request that skips the CORS preflight,
+        and _read_json doesn't care what the body was labelled — so without
+        this, a web page could write files into any folder on the machine,
+        start the 4 GB OCR download, or point /open at a network share. DNS
+        rebinding can put a foreign hostname in front of 127.0.0.1 as well.
+        So the Host must be this server, and a POST that names an Origin must
+        name this one. Browsers always send Origin on a cross-site POST; a
+        request with none (curl, a script) isn't coming from a web page."""
+        port = self.server.server_address[1]
+        ours = {f"127.0.0.1:{port}", f"localhost:{port}"}
+        if self.headers.get("Host", "") not in ours:
+            return False
+        origin = self.headers.get("Origin")
+        return (self.command != "POST" or origin is None
+                or origin in {f"http://{host}" for host in ours})
 
     def _json(self, code: int, payload: dict):
         body = json.dumps(payload).encode()
@@ -2469,6 +2651,9 @@ class Handler(BaseHTTPRequestHandler):
         return json.loads(self.rfile.read(length))
 
     def do_GET(self):
+        if not self._trusted():
+            self.send_error(403)
+            return
         if self.path in ("/", "/index.html"):
             body = (HTML_PAGE
                     .replace("__DEFAULT_OUTPUT__", html.escape(str(DEFAULT_OUTPUT), quote=True))
@@ -2508,6 +2693,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
+        if not self._trusted():
+            self.send_error(403)
+            return
         if self.path == "/convert-doc":
             try:
                 req = self._read_json()
@@ -2580,7 +2768,7 @@ def main():
     port = args.port
     for candidate in range(args.port, args.port + 10):  # double-launch friendly
         try:
-            server = ThreadingHTTPServer(("127.0.0.1", candidate), Handler)
+            server = Server(("127.0.0.1", candidate), Handler)
             port = candidate
             break
         except OSError:
